@@ -4,7 +4,7 @@ using System.Security.Principal;
 
 class Program
 {    static void Main(string[] args)
-    {        Logger.Success("Starting Kerberos ticket extraction process...");
+    {        Console.WriteLine("Starting Kerberos ticket extraction process...");
         
         try
         {
@@ -13,11 +13,11 @@ class Program
         }
         catch (Exception ex)
         {
-            Logger.Error($"Critical error: {ex.Message}");
+            Console.WriteLine($"Critical error: {ex.Message}");
             Console.WriteLine(ex.StackTrace);
         }
         
-        Logger.Success("Process completed.");
+        Console.WriteLine("Process completed.");
     }
 }
 
