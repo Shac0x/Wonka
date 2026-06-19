@@ -12,8 +12,11 @@
 
 ## ✨ Features
 
-- 🔐 **System Impersonation** - Automatically becomes SYSTEM to access LSA
+- 🔐 **System Impersonation** - Automatically becomes SYSTEM to access LSA (when running elevated)
+- 👤 **Privilege-aware** - Standard users dump only their *own* session via an untrusted LSA connection; no SYSTEM impersonation required
 - 📋 **Session Discovery** - Finds all active logon sessions
+- 🗂️ **List mode** - List users and ticket metadata only, without extracting the base64 blobs
+- 🎯 **Single-ticket dump** - Target one ticket by LUID and/or service name
 - 🎟️ **Ticket Extraction** - Retrieves detailed Kerberos ticket information
 - 📦 **Base64 Output** - Ready-to-use ticket format
 
@@ -21,8 +24,8 @@
 
 ### Requirements
 - Windows machine
-- Administrator privileges
-- .NET 7.0+ (for building)
+- Administrator privileges *for dumping every session* (a standard user can still dump their own tickets)
+- .NET 8.0+ (for building)
 
 ### Installation
 
@@ -39,19 +42,56 @@ dotnet build --configuration Release
 ### Usage
 
 ```powershell
-# Run as Administrator
-.\Wonka.exe
+.\Wonka.exe <list|dump> [/luid:<luid>] [/service:<name>]
+```
+
+> Running `.\Wonka.exe` with **no arguments** (or `-h`) prints the help — you must pass `dump` or `list` explicitly to do anything.
+
+Wonka adapts to the privileges it is running with:
+
+- **Administrator** → processes every logon session on the host.
+- **Standard user** → processes only the current user's tickets (untrusted LSA connection, no SYSTEM impersonation).
+
+#### Modes & options
+
+| Command | What it does |
+|---------|--------------|
+| `.\Wonka.exe` *(no args)* | Show help. |
+| `.\Wonka.exe dump` | Extract tickets (base64) for every accessible session. |
+| `.\Wonka.exe list` | List users and ticket **metadata only** — no base64 is extracted. |
+| `.\Wonka.exe dump /luid:<luid>` | Dump only the session with the given LUID (hex `0x3e7` or decimal `999`). |
+| `.\Wonka.exe dump /service:<name>` | Dump only tickets whose server name contains `<name>` (e.g. `krbtgt`, `cifs/host.domain`). |
+| `.\Wonka.exe dump /luid:0x3e7 /service:krbtgt` | Combine filters to dump a **single** ticket. |
+| `.\Wonka.exe -h` | Show help. |
+
+> `/luid` and `/service` are dump-only filters; combining them with `list` is rejected.
+
+#### Examples
+
+```powershell
+# Show help (also shown when run with no arguments)
+.\Wonka.exe -h
+
+# Dump every accessible ticket (all sessions if elevated, otherwise just yours)
+.\Wonka.exe dump
+
+# Just enumerate who has tickets, without pulling the blobs (admin)
+.\Wonka.exe list
+
+# Pull a single krbtgt ticket (TGT) for one logon session
+.\Wonka.exe dump /luid:0x3e7 /service:krbtgt
 ```
 
 ## 📖 Sample Output
 
 ```
-[+] Starting Kerberos ticket extraction process...
+Starting Kerberos ticket extraction process...
+[+] Running with administrative privileges
 [+] Successfully impersonated as SYSTEM
 [+] Logon sessions found: 15
 
 [+] User: charlie.bucket@CHOCOLATE.FACTORY
-[+] Tickets found: 3
+[+] LogonId: 0x3e7 | Tickets found: 3
 
 -----------------------------------------------------------------------
 Username = charlie.bucket
@@ -63,36 +103,45 @@ Ticket b64 ---> YIIFgjCCBX6gAwIBBaEDAgEWooIEhjCCBIJhggR+MII...
 -----------------------------------------------------------------------
 ```
 
+> In `list` mode the output is identical **except** the `Ticket b64` / `EncType` lines are omitted — you get the metadata without the extractable ticket blob.
+
 ## 🏗️ Project Structure
 
 ```
-wonka/
-├── Program.cs      # Main ticket extraction logic
-├── winapi.cs       # Windows API definitions
-├── Config.cs       # Configuration and logging
-└── wonka.csproj    # Project file
+Wonka/
+├── Program.cs      # CLI parsing + ticket extraction logic
+├── Winapi.cs       # Windows API definitions
+└── Wonka.csproj    # Project file
 ```
 
 ## 🔧 Technical Details
 
 ### Core APIs Used
-- `OpenProcessToken` - Process token access
-- `LsaRegisterLogonProcess` - LSA registration
+- `OpenProcessToken` / `DuplicateTokenEx` / `ImpersonateLoggedOnUser` / `RevertToSelf` - SYSTEM impersonation (admin path)
+- `LsaRegisterLogonProcess` - Privileged LSA registration (admin path)
+- `LsaConnectUntrusted` - Unprivileged LSA connection for the current user (standard-user path)
 - `LsaEnumerateLogonSessions` - Session enumeration
 - `LsaCallAuthenticationPackage` - Kerberos communication
 
 ### How It Works
-1. Impersonates SYSTEM via winlogon process token
-2. Registers with Local Security Authority
+
+**Elevated (Administrator):**
+1. Impersonates SYSTEM via the winlogon process token
+2. Registers with the Local Security Authority (`LsaRegisterLogonProcess`)
 3. Enumerates all logon sessions
-4. Extracts Kerberos tickets from each session
-5. Outputs tickets in Base64 format
+4. Extracts Kerberos tickets from each session (or only those matching `/luid` / `/service`)
+5. Outputs tickets in Base64 format (or metadata only in `list` mode)
+
+**Standard user:**
+1. Opens an untrusted LSA connection (`LsaConnectUntrusted`) — no impersonation needed
+2. Queries the caller's own logon session (LUID `{0,0}`)
+3. Extracts the current user's Kerberos tickets
 
 ## 🛠️ Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
-| "Could not impersonate as SYSTEM" | Run as Administrator |
+| "Could not impersonate as SYSTEM" | Run as Administrator (or run as a standard user to dump just your own tickets) |
 | "Could not initialize LSA" | Check Windows compatibility |
 | "No tickets found" | Ensure Kerberos is in use (`klist`) |
 

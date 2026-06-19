@@ -45,6 +45,9 @@ public static class win32
     public static extern bool ImpersonateLoggedOnUser(IntPtr hToken);
 
     [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool RevertToSelf();
+
+    [DllImport("advapi32.dll", SetLastError = true)]
     public static extern bool OpenProcessToken(
         IntPtr ProcessHandle,
         uint DesiredAccess,
@@ -65,9 +68,14 @@ public static class win32
     // LSA Functions
     [DllImport("secur32.dll", SetLastError = true)]
     public static extern int LsaRegisterLogonProcess(
-        LSA_STRING_IN LogonProcessName, 
-        out IntPtr LsaHandle, 
+        LSA_STRING_IN LogonProcessName,
+        out IntPtr LsaHandle,
         out ulong SecurityMode);
+
+    // Untrusted connection: usable by a non-privileged caller, but can only
+    // query/retrieve tickets for its own logon session.
+    [DllImport("secur32.dll", SetLastError = true)]
+    public static extern int LsaConnectUntrusted(out IntPtr LsaHandle);
 
     [DllImport("secur32.dll", SetLastError = false)]
     public static extern int LsaLookupAuthenticationPackage(

